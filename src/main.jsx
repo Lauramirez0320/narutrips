@@ -1,13 +1,14 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Plane, CalendarDays, Wallet, Plus, Trash2, ChevronLeft, ChevronRight,
-  MapPin, CheckCircle2, BriefcaseBusiness, Clock3, Sparkles, Info, X
+  MapPin, CheckCircle2, BriefcaseBusiness, Clock3, Sparkles, Info, X, LogOut
 } from "lucide-react";
+import { supabase, supabaseConfigError } from "./lib/supabase";
 import "./style.css";
+import "./auth.css";
 
 const START_MONTH = "2026-11";
-const STORAGE_KEY = "naru-trips-v1";
 const HOLIDAYS = [
   ["2026-11-02","Todos los Santos"],
   ["2026-12-08","Inmaculada Concepción"],["2026-12-25","Navidad"],
@@ -28,17 +29,12 @@ const parseDate = s => new Date(s+"T12:00:00");
 const addMonths = (key,n) => { const [y,m]=key.split("-").map(Number); return monthKey(new Date(y,m-1+n,15)); };
 const daysInMonth = key => { const [y,m]=key.split("-").map(Number); return new Date(y,m,0).getDate(); };
 const isWeekday = d => d.getDay()!==0 && d.getDay()!==6;
-const emptyData = () => ({events:[], holidays:HOLIDAYS, flights:[], budget:"", initializedFrom:START_MONTH});
+const emptyData = () => ({events:[], holidays:[], flights:[], budgets:{}});
 
-function loadData(){
-  try {
-    const saved=JSON.parse(localStorage.getItem(STORAGE_KEY));
-    return saved ? {...emptyData(),...saved, holidays:saved.holidays||HOLIDAYS} : emptyData();
-  } catch { return emptyData(); }
-}
-
-function App(){
-  const [data,setData]=useState(loadData);
+function NaruTrips({ session }){
+  const [data,setData]=useState(emptyData);
+  const [isLoadingData,setIsLoadingData]=useState(true);
+  const [dataError,setDataError]=useState("");
   const [month,setMonth]=useState(START_MONTH);
   const [tab,setTab]=useState("overview");
   const [eventDate,setEventDate]=useState(START_MONTH+"-03");
@@ -46,11 +42,35 @@ function App(){
   const [holidayDate,setHolidayDate]=useState("");
   const [holidayName,setHolidayName]=useState("");
   const [flight,setFlight]=useState({type:"Ida",date:"",price:"",airline:"",direct:true});
-  const [budget,setBudget]=useState(data.budget||"");
+  const [budget,setBudget]=useState("");
   const [toast,setToast]=useState("");
 
-  const save = next => { setData(next); localStorage.setItem(STORAGE_KEY,JSON.stringify(next)); };
   const notify = msg => { setToast(msg); setTimeout(()=>setToast(""),2200); };
+
+  useEffect(()=>{
+    let isMounted=true;
+    const loadRemoteData=async()=>{
+      setIsLoadingData(true);
+      setDataError("");
+      const [eventsResult,holidaysResult,flightsResult,budgetsResult]=await Promise.all([
+        supabase.from("attendance_records").select("date,type").eq("user_id",session.user.id).order("date"),
+        supabase.from("holidays").select("id,date,name").eq("user_id",session.user.id).order("date"),
+        supabase.from("flight_options").select("id,type,date,price,airline,direct").eq("user_id",session.user.id).order("date"),
+        supabase.from("monthly_budgets").select("month,amount").eq("user_id",session.user.id)
+      ]);
+      const results=[eventsResult,holidaysResult,flightsResult,budgetsResult];
+      const failed=results.find(result=>result.error);
+      if(!isMounted) return;
+      if(failed){setDataError("No se pudieron cargar tus datos. Inténtalo de nuevo.");setIsLoadingData(false);return;}
+      const budgets=Object.fromEntries(budgetsResult.data.map(item=>[item.month,String(item.amount ?? "")]));
+      setData({events:eventsResult.data,holidays:holidaysResult.data,flights:flightsResult.data,budgets});
+      setIsLoadingData(false);
+    };
+    loadRemoteData();
+    return ()=>{isMounted=false;};
+  },[session.user.id]);
+
+  useEffect(()=>setBudget(data.budgets[month]||""),[data.budgets,month]);
 
   const holidayMap = useMemo(()=>new Map(data.holidays.map(h=>[h.date,h.name])),[data.holidays]);
   const eventMap = useMemo(()=>new Map(data.events.map(e=>[e.date,e.type])),[data.events]);
@@ -103,29 +123,74 @@ function App(){
   const cells=[...Array(offset).fill(null),...Array.from({length:monthDays},(_,i)=>i+1)];
   while(cells.length%7) cells.push(null);
 
-  const addEvent=()=>{
+  const addEvent=async()=>{
     if(!eventDate || eventDate<START_MONTH+"-01"){notify("El historial comienza en noviembre de 2026.");return;}
     if(!isWeekday(parseDate(eventDate))){notify("Selecciona un día de lunes a viernes.");return;}
     if(holidayMap.has(eventDate) && eventType!=="office"){notify("Ese día ya está marcado como festivo.");return;}
-    const events=data.events.filter(e=>e.date!==eventDate);
-    events.push({date:eventDate,type:eventType});
-    save({...data,events});
+    const existing=data.events.some(event=>event.date===eventDate);
+    const query=existing
+      ? supabase.from("attendance_records").update({type:eventType}).eq("user_id",session.user.id).eq("date",eventDate)
+      : supabase.from("attendance_records").insert({user_id:session.user.id,date:eventDate,type:eventType});
+    const {error}=await query;
+    if(error){notify("No se pudo guardar el registro.");return;}
+    setData(current=>({...current,events:[...current.events.filter(event=>event.date!==eventDate),{date:eventDate,type:eventType}]}));
     notify("Registro guardado.");
   };
-  const removeEvent=date=>save({...data,events:data.events.filter(e=>e.date!==date)});
-  const addHoliday=()=>{
+  const removeEvent=async date=>{
+    const {error}=await supabase.from("attendance_records").delete().eq("user_id",session.user.id).eq("date",date);
+    if(error){notify("No se pudo eliminar el registro.");return;}
+    setData(current=>({...current,events:current.events.filter(event=>event.date!==date)}));
+  };
+  const addHoliday=async()=>{
     if(!holidayDate||!holidayName.trim()) return;
-    save({...data,holidays:[...data.holidays.filter(h=>h.date!==holidayDate),{date:holidayDate,name:holidayName.trim()}]});
+    const existing=data.holidays.find(holiday=>holiday.date===holidayDate);
+    const query=existing
+      ? supabase.from("holidays").update({name:holidayName.trim()}).eq("id",existing.id).eq("user_id",session.user.id).select("id,date,name").single()
+      : supabase.from("holidays").insert({user_id:session.user.id,date:holidayDate,name:holidayName.trim()}).select("id,date,name").single();
+    const {data:holiday,error}=await query;
+    if(error){notify("No se pudo guardar el festivo.");return;}
+    setData(current=>({...current,holidays:[...current.holidays.filter(item=>item.date!==holidayDate),holiday]}));
     setHolidayDate("");setHolidayName("");notify("Festivo agregado.");
   };
-  const removeHoliday=date=>save({...data,holidays:data.holidays.filter(h=>h.date!==date)});
-  const addFlight=()=>{
+  const removeHoliday=async id=>{
+    const {error}=await supabase.from("holidays").delete().eq("id",id).eq("user_id",session.user.id);
+    if(error){notify("No se pudo eliminar el festivo.");return;}
+    setData(current=>({...current,holidays:current.holidays.filter(holiday=>holiday.id!==id)}));
+  };
+  const addFlight=async()=>{
     if(!flight.date||!flight.price){notify("Completa fecha y precio del vuelo.");return;}
-    save({...data,flights:[...data.flights,{...flight,id:crypto.randomUUID()}]});
+    const {data:createdFlight,error}=await supabase.from("flight_options").insert({user_id:session.user.id,...flight,price:Number(flight.price)}).select("id,type,date,price,airline,direct").single();
+    if(error){notify("No se pudo guardar el vuelo.");return;}
+    setData(current=>({...current,flights:[...current.flights,createdFlight]}));
     setFlight({...flight,date:"",price:"",airline:""});notify("Vuelo agregado.");
   };
-  const removeFlight=id=>save({...data,flights:data.flights.filter(f=>f.id!==id)});
+  const removeFlight=async id=>{
+    const {error}=await supabase.from("flight_options").delete().eq("id",id).eq("user_id",session.user.id);
+    if(error){notify("No se pudo eliminar el vuelo.");return;}
+    setData(current=>({...current,flights:current.flights.filter(flight=>flight.id!==id)}));
+  };
+  const updateBudget=async value=>{
+    setBudget(value);
+    const amount=value===""?0:Number(value);
+    const {error}=await supabase.from("monthly_budgets").upsert({user_id:session.user.id,month,amount},{onConflict:"user_id,month"});
+    if(error){notify("No se pudo actualizar el presupuesto.");return;}
+    setData(current=>({...current,budgets:{...current.budgets,[month]:value}}));
+  };
+  const resetData=async()=>{
+    if(!confirm("¿Borrar todos los registros guardados en tu cuenta?")) return;
+    const results=await Promise.all([
+      supabase.from("attendance_records").delete().eq("user_id",session.user.id),
+      supabase.from("holidays").delete().eq("user_id",session.user.id),
+      supabase.from("flight_options").delete().eq("user_id",session.user.id),
+      supabase.from("monthly_budgets").delete().eq("user_id",session.user.id)
+    ]);
+    if(results.some(result=>result.error)){notify("No se pudieron reiniciar todos los datos.");return;}
+    setData(emptyData());
+    notify("Datos reiniciados.");
+  };
   const changeMonth=delta=>setMonth(addMonths(month,delta));
+
+  if(isLoadingData) return <main className="auth-page"><p className="auth-loading">Cargando tus datos...</p></main>;
 
   return <div className="app-shell">
     <aside className="sidebar">
@@ -135,11 +200,12 @@ function App(){
           <button key={id} className={tab===id?"nav-item active":"nav-item"} onClick={()=>setTab(id)}><Icon size={18}/>{label}</button>)}
       </nav>
       <div className="sidebar-note"><Sparkles size={16}/><span>Cartagena <b>↔</b> Bogotá</span></div>
-      <div className="sidebar-foot">MVP 1.0 · Datos guardados en este dispositivo</div>
+      <div className="sidebar-foot">MVP 1.0 · Datos sincronizados con Supabase</div>
     </aside>
 
     <main className="main">
-      <header className="topbar"><div><span className="eyebrow">PLANIFICACIÓN PERSONAL</span><h1>{tab==="overview"?"Tu presencialidad, bajo control":tab==="calendar"?"Calendario de presencialidad":tab==="flights"?"Planificador de vuelos":"Configuración"}</h1></div><div className="avatar">N</div></header>
+      {dataError&&<div className="hint" role="alert">{dataError}</div>}
+      <header className="topbar"><div><span className="eyebrow">PLANIFICACIÓN PERSONAL</span><h1>{tab==="overview"?"Tu presencialidad, bajo control":tab==="calendar"?"Calendario de presencialidad":tab==="flights"?"Planificador de vuelos":"Configuración"}</h1></div><div className="account-actions"><span className="user-email">{session.user.email}</span><button className="logout-button" onClick={()=>supabase.auth.signOut()} title="Cerrar sesión"><LogOut size={16}/><span>Cerrar sesión</span></button><div className="avatar">N</div></div></header>
 
       {tab==="overview" && <section className="content">
         <div className="welcome-card"><div><span className="eyebrow light">TRIMESTRE MÓVIL · COLOMBIA</span><h2>Viaja con calma.<br/><em>Organiza con inteligencia.</em></h2><p>Tu objetivo es cumplir el 20% de presencialidad sin perder de vista el costo de cada viaje.</p><button className="light-button" onClick={()=>setTab("calendar")}>Ver calendario <ChevronRight size={16}/></button></div><div className="hero-orbit"><div className="orbit-circle"><Plane size={34}/></div><span className="orbit-dot dot-a"/><span className="orbit-dot dot-b"/></div></div>
@@ -215,15 +281,52 @@ function App(){
         <div className="panel"><span className="eyebrow">FESTIVOS</span><h3>Administrar festivos</h3><p className="muted">Puedes agregar o quitar fechas. Revisa especialmente los festivos locales y el calendario oficial aplicable a tu site.</p>
           <div className="form-grid"><label>Fecha<input type="date" value={holidayDate} onChange={e=>setHolidayDate(e.target.value)}/></label><label>Nombre<input placeholder="Nombre del festivo" value={holidayName} onChange={e=>setHolidayName(e.target.value)}/></label></div>
           <button className="primary-button" onClick={addHoliday}><Plus size={16}/> Agregar festivo</button>
-          <div className="record-list holiday-list">{data.holidays.slice().sort((a,b)=>a.date.localeCompare(b.date)).map(h=><div className="record" key={h.date}><span>{parseDate(h.date).toLocaleDateString("es-CO",{day:"numeric",month:"short",year:"numeric"})} · {h.name}</span><button className="delete-btn" onClick={()=>removeHoliday(h.date)}><Trash2 size={15}/></button></div>)}</div>
+          <div className="record-list holiday-list">{data.holidays.slice().sort((a,b)=>a.date.localeCompare(b.date)).map(h=><div className="record" key={h.id}><span>{parseDate(h.date).toLocaleDateString("es-CO",{day:"numeric",month:"short",year:"numeric"})} · {h.name}</span><button className="delete-btn" onClick={()=>removeHoliday(h.id)}><Trash2 size={15}/></button></div>)}</div>
         </div>
-        <div className="panel"><span className="eyebrow">PRESUPUESTO</span><h3>Referencia mensual</h3><label>Presupuesto de vuelos (COP)<input type="number" min="0" value={budget} onChange={e=>{setBudget(e.target.value);save({...data,budget:e.target.value});}} placeholder="Ej. 600000"/></label><p className="muted">Tu gasto registrado del mes seleccionado: {money(totalTravel)}.</p></div>
-        <div className="panel danger-zone"><h3>Datos de la aplicación</h3><p className="muted">Los datos están guardados localmente en este navegador.</p><button className="outline-button" onClick={()=>{if(confirm("¿Borrar todos los registros guardados en este dispositivo?")){localStorage.removeItem(STORAGE_KEY);setData(emptyData());notify("Datos reiniciados.");}}}>Restablecer datos</button></div>
+        <div className="panel"><span className="eyebrow">PRESUPUESTO</span><h3>Referencia mensual</h3><label>Presupuesto de vuelos (COP)<input type="number" min="0" value={budget} onChange={e=>updateBudget(e.target.value)} placeholder="Ej. 600000"/></label><p className="muted">Tu gasto registrado del mes seleccionado: {money(totalTravel)}.</p></div>
+        <div className="panel danger-zone"><h3>Datos de la aplicación</h3><p className="muted">Tus datos se guardan de forma segura en tu cuenta.</p><button className="outline-button" onClick={resetData}>Restablecer datos</button></div>
       </section>}
       <footer className="footer">Hecho para organizar tus viajes con un poquito más de calma <span>✦</span></footer>
     </main>
     {toast&&<div className="toast"><CheckCircle2 size={17}/>{toast}</div>}
   </div>;
+}
+
+function LoginForm(){
+  const [email,setEmail]=useState("");
+  const [password,setPassword]=useState("");
+  const [error,setError]=useState("");
+  const [isSubmitting,setIsSubmitting]=useState(false);
+
+  const handleSubmit=async event=>{
+    event.preventDefault();
+    setError("");
+    setIsSubmitting(true);
+    const { error: signInError }=await supabase.auth.signInWithPassword({email,password});
+    if(signInError) setError(signInError.message);
+    setIsSubmitting(false);
+  };
+
+  return <main className="auth-page"><section className="auth-card"><div className="brand auth-brand"><div className="brand-mark"><Plane size={20}/></div><div><b>Naru Trips</b><small>Tu agenda de viajes</small></div></div><div className="auth-copy"><span className="eyebrow">BIENVENIDA</span><h1>Inicia sesión</h1><p>Accede a tu planificación de viajes y presencialidad.</p></div><form onSubmit={handleSubmit} className="auth-form"><label>Correo electrónico<input type="email" value={email} onChange={event=>setEmail(event.target.value)} autoComplete="email" required/></label><label>Contraseña<input type="password" value={password} onChange={event=>setPassword(event.target.value)} autoComplete="current-password" required/></label>{error&&<p className="auth-error" role="alert">{error}</p>}<button className="primary-button auth-submit" type="submit" disabled={isSubmitting}>{isSubmitting?"Ingresando...":"Iniciar sesión"}</button></form></section></main>;
+}
+
+function App(){
+  if(supabaseConfigError) return <main className="auth-page"><section className="auth-card"><p className="auth-error" role="alert">{supabaseConfigError}</p></section></main>;
+  const [session,setSession]=useState(null);
+  const [isLoading,setIsLoading]=useState(true);
+
+  useEffect(()=>{
+    supabase.auth.getSession().then(({data:{session},error})=>{
+      if(error) console.error("No se pudo recuperar la sesión:",error.message);
+      setSession(session);
+      setIsLoading(false);
+    });
+    const {data:{subscription}}=supabase.auth.onAuthStateChange((_event,nextSession)=>setSession(nextSession));
+    return ()=>subscription.unsubscribe();
+  },[]);
+
+  if(isLoading) return <main className="auth-page"><p className="auth-loading">Cargando Naru Trips...</p></main>;
+  return session?<NaruTrips session={session}/>:<LoginForm/>;
 }
 
 createRoot(document.getElementById("root")).render(<App/>);
